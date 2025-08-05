@@ -25,7 +25,7 @@ importlib.reload(data_prep)
 
 class NamedEntityPredictor:
     """
-    Предсказывает NER-метки в батче
+    Предсказывает NER-метки в батче, метки соответствуют id2label
     """
     def __init__(self,
                  model: BertForTokenClassification,
@@ -44,7 +44,7 @@ class NamedEntityPredictor:
                                       attention_mask=batch["attention_mask"],
                                       labels=batch["labels"],
                                       return_dict=True)
-        indices = torch.argmax(model_output.logits, axis=2) # здесь индексы из model.config.id2label
+        indices = torch.argmax(model_output.logits, axis=2) # здесь индексы лейблов, на которых была обучена модель
         indices = indices.detach().cpu().numpy()
 
         label2id = self.label2id
@@ -90,6 +90,16 @@ def train_eval_ner(model_ft, tokenizer, device, optimizer, num_epochs, lr_schedu
     Возвращает дообученную модель, репорты по классам до и после файн-тюна, метрики по эпохам
     """
     num_labels = 9
+
+    # словари для перевода конлл-ных меток в модельные и обратно
+    label2id = {v : k for k, v in id2label.items()}
+    model_id2label = model_ft.config.id2label
+    model_to_conll = {
+        model_idx: label2id[label]
+        for model_idx, label in model_id2label.items()
+    }
+    conll_to_model = {v : k for k, v in model_to_conll.items()}
+        
     """
     Создаем даталоадеры
     """
@@ -115,12 +125,13 @@ def train_eval_ner(model_ft, tokenizer, device, optimizer, num_epochs, lr_schedu
 
     print(f"Evaluating model without fine-tuning")
     for batch in tqdm(base_test_dataloader):
-        predicted_labels["base_test"].extend(ner_base.predict(batch)["predicted_labels"])
+        predicted_labels["base_test"].extend(ner_base.predict(batch)["predicted_labels"]) # получаем conll-ные метки до файн-тюна
         
     for batch in tqdm(ft_test_dataloader):
         predicted_labels["ft_test"].extend(ner_base.predict(batch)["predicted_labels"])
     print(f"")
-    
+
+    # здесь в example["text_labels"] conll-ные метки
     base_report_before = classification_report(y_true=[list(example["text_labels"]) for example in base_test_dataset],
                                                          y_pred=predicted_labels["base_test"], output_dict=True)
 
@@ -155,17 +166,25 @@ def train_eval_ner(model_ft, tokenizer, device, optimizer, num_epochs, lr_schedu
         # тренируем
         model_ft.train()
         loop = tqdm(ft_train_dataloader, desc=f"Epoch {epoch+1}")
+        
+        # в batch["labels"] conll-ные метки, а модели на вход нужно подавать её собственные
         for batch in loop:
+            conll_labels = batch["labels"]
+            # создаем mapping_array: в нем индекс - метка из conll, значение - модельная метка
+            labels_model = torch.full_like(conll_labels, fill_value=-100)
+            for conll_id, model_id in conll_to_model.items():
+                labels_model[conll_labels == conll_id] = model_id
+
             outputs = model_ft(input_ids=batch["input_ids"],
                          token_type_ids=batch["token_type_ids"],
                          attention_mask=batch["attention_mask"],
-                         labels=batch["labels"], return_dict=True)
-            logits = outputs.logits.view(-1, num_labels)
-            labels = batch["labels"].view(-1)
-            loss = loss_fn(logits, labels)
+                         labels=labels_model, return_dict=True)
+            logits = outputs.logits.view(-1, num_labels) # логиты соответствуют собственным меткам
+            labels_model = labels_model.view(-1)
+            loss = loss_fn(logits, labels_model)
             loss.backward()
     
-            clip_grad_norm_(model_ft.parameters(), max_norm=1.0)
+            # clip_grad_norm_(model_ft.parameters(), max_norm=1.0)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
@@ -176,25 +195,37 @@ def train_eval_ner(model_ft, tokenizer, device, optimizer, num_epochs, lr_schedu
         test_losses=[]
         with torch.no_grad():
             for batch in ft_test_dataloader:
+                conll_labels = batch["labels"]
+                # создаем mapping_array: в нем индекс - метка из conll, значение - модельная метка
+                labels_model = torch.full_like(conll_labels, fill_value=-100)
+                for conll_id, model_id in conll_to_model.items():
+                    labels_model[conll_labels == conll_id] = model_id
+                            
                 outputs = model_ft(input_ids=batch["input_ids"],
                              token_type_ids=batch["token_type_ids"],
                              attention_mask=batch["attention_mask"],
-                             labels=batch["labels"], return_dict=True)
+                             labels=labels_model, return_dict=True)
                 loss = outputs['loss'].item()
                 test_losses.append(loss)
     
             for batch in ft_train_dataloader:
+                conll_labels = batch["labels"]
+                # создаем mapping_array: в нем индекс - метка из conll, значение - модельная метка
+                labels_model = torch.full_like(conll_labels, fill_value=-100)
+                for conll_id, model_id in conll_to_model.items():
+                    labels_model[conll_labels == conll_id] = model_id
+                
                 outputs = model_ft(input_ids=batch["input_ids"],
                              token_type_ids=batch["token_type_ids"],
                              attention_mask=batch["attention_mask"],
-                             labels=batch["labels"], return_dict=True)
+                             labels=labels_model, return_dict=True)
                 loss = outputs['loss'].item()
                 train_losses.append(loss)
     
         train_losses=np.array(train_losses)
         test_losses=np.array(test_losses)
 
-        ner = NamedEntityPredictor(model_ft, tokenizer, id2label)
+        ner = NamedEntityPredictor(model_ft, tokenizer, id2label) # возвращает conll-ные метки
         predicted_labels = {"ft_test": [], "base_test": []}
         
         for batch in ft_test_dataloader:
@@ -212,7 +243,7 @@ def train_eval_ner(model_ft, tokenizer, device, optimizer, num_epochs, lr_schedu
         Оценка модели с файн-тюном
         """
         # print(f"Evaluating fine-tuned model")
-        ner = NamedEntityPredictor(model_ft, tokenizer, id2label)
+        ner = NamedEntityPredictor(model_ft, tokenizer, id2label) # возвращает conll-ные метки
         predicted_labels = {"ft_test": [], "base_test": []}
         
         for batch in base_test_dataloader:
